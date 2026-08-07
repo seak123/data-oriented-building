@@ -1,187 +1,200 @@
-# Data-Oriented Building System
+# Data-Oriented Building — An ECS-Style Building System
 
-A reference design for an **open-world building system** where players place a very large
-number of persistent objects, and where a per-object `Actor` simply does not scale. The core
-idea: represent building pieces as **lightweight entities composed of fragments** (an
-ECS/Mass-style model), render them **instanced**, replicate them with a **delta channel**,
-and only promote an entity to a real `Actor` **on demand** from a shared pool.
+> 一套能承载**海量、永久**建筑的建造系统技术参照实现：用实体 + 片段（ECS / Mass 风格）取代"每个建筑一个 Actor"，配合实例化渲染、增量同步、以及按需的 Actor 对象池。
+>
+> A reference implementation of an open-world building system built to hold a **very large number of persistent objects**. Building pieces are **lightweight entities composed of fragments** (an ECS/Mass-style model) rather than one `Actor` each — rendered instanced, replicated through a throttled delta channel, and promoted to a real `Actor` only on demand from a shared pool.
 
-> **About this repository.** Original *clean-room* write-up of an architecture I designed and
-> owned in a commercial title. **No proprietary source** — the code below is illustrative
-> reference code written to explain the approach and the trade-offs.
-
----
-
-## 1. Problem
-
-Players build homes freely; buildings persist **permanently** and a single base can hold
-**thousands** of pieces. One `AActor` per piece blows up on three axes at once:
-
-- **CPU/memory** — thousands of actors, components, and tick registrations;
-- **network** — thousands of replicated actors saturating the channel;
-- **rendering** — thousands of draw calls.
-
-The system also had to survive the core building *rules* being redesigned several times, so
-the architecture had to be reshapeable without rewrites.
+<p align="left">
+  <img alt="Created" src="https://img.shields.io/badge/created-2024-6f42c1">
+  <img alt="Engine" src="https://img.shields.io/badge/Unreal_Engine-C%2B%2B-0E1128?logo=unrealengine">
+  <img alt="Paradigm" src="https://img.shields.io/badge/paradigm-data--oriented_%2F_ECS-1f6feb">
+  <img alt="Type" src="https://img.shields.io/badge/type-reference_implementation-orange">
+</p>
 
 ---
 
-## 2. Architecture — entities, not actors
+## 📌 Context
+
+This distills a system I designed and owned in a shipped commercial title, where players build
+homes freely and buildings persist **permanently** — a single base can hold **thousands** of
+pieces. I was responsible for the whole framework: persistence, synchronization, entity/proxy
+management, and the modular workflow other engineers and designers extended.
+
+> **This repository is a clean-room reference.** Original code written for portfolio purposes,
+> reduced to the load-bearing architecture. It contains **no proprietary or third-party source**;
+> engine-facing types are illustrative stand-ins.
+
+---
+
+## 🎯 The problem, precisely
+
+One `AActor` per building piece blows up on three axes at once:
+
+| Axis | Failure at scale |
+|---|---|
+| **CPU / memory** | Thousands of actors, components, and tick registrations. |
+| **Network** | Thousands of replicated actors saturating the channel. |
+| **Rendering** | Thousands of draw calls. |
+
+And a fourth, softer constraint that shaped the architecture as much as performance: the core
+building **rules were redesigned several times** during development, so the system had to be
+**reshapeable without rewrites**.
+
+---
+
+## 🧭 Architecture — entities, not actors
 
 ```
-   Persistence (DB)  <--dump/load-->  Entity Store (fragments)  <--delta-->  Clients
-                                            |         |
-                              +-------------+         +--------------+
-                              |                                      |
-                     Representation                            Proxy Pool
-                     (Instanced Static Mesh)             (shared Actors, on demand)
-                              |                                      |
-                     one draw batch per mesh              only near/interacted pieces
-                                                          get a real Actor
+   Persistence (DB)  <--dump/load-->   Entity Store (fragments)  <--delta-->  Clients
+        version #s                          |            |
+                            +---------------+            +---------------+
+                            |                                            |
+                   Representation                                   Proxy Pool
+                   (Instanced Static Mesh)                    (shared Actors, on demand)
+                   thousands -> a few batches                only near / interacted pieces
+                                                             are promoted to a real Actor
 ```
 
-- **Entity = a set of fragments.** A building piece is data: a handful of small `struct`
-  fragments (transform, health, type, support, coating…). No actor, no components, until it
-  needs one.
-- **Representation layer** draws pieces as **Instanced Static Meshes** — thousands of walls =
-  a few draw batches, not thousands.
-- **Proxy pool** hands out a small number of shared `Actor` "proxies" only to pieces the
-  player is near or interacting with (collision, interaction, UI). Everything else stays pure
-  data.
-- **Persistence** dumps/loads entities to a compact record with **version numbers** for
-  incremental saving.
+**The central idea:** *the number of live Actors is decoupled from the number of buildings.*
+Most pieces are pure data plus an instanced mesh; only the handful a player is near become
+actors. Everything else in the design follows from that decision.
 
-This is the heart of the optimization story: **the number of live Actors is decoupled from
-the number of buildings.**
+- **Entity = a set of fragments** — a piece is data (transform, health, type, support, coating…),
+  no actor or components until it needs one.
+- **Representation** draws pieces as **Instanced Static Meshes** — thousands of identical walls
+  collapse into a few draw batches.
+- **Proxy pool** lends a capped number of shared `Actor` proxies for collision/interaction/UI.
+- **Persistence** dumps/loads entities with **version numbers** for incremental saving.
 
 ---
 
-## 3. Fragment composition + replicated/transient split
+## 1. Fragment composition + replicated / transient split
 
-The design decision that keeps memory tight and iteration fast: **only data that must sync
-lives in the replicated agent; everything else lives in a transient side-struct held by
-pointer**, so the replicated array stays small and cache-friendly to iterate.
+**Decision.** Keep the replicated agent as small as possible; push everything that doesn't need
+to sync into a **transient side-struct held by pointer**, off the hot array.
+
+**Why.** The replicated array is walked every frame for representation and replication. Cold data
+(asset handles, the bound proxy, selection state) has no business on that hot path — it inflates
+per-object memory and hurts cache locality on the traversal that runs at scale. Separating the two
+keeps the hot array tight and fast, and keeps agent copies inside the fast-array cheap.
 
 ```cpp
-// --- Small composable fragments: a piece "is" whatever fragments it carries. ---
-USTRUCT() struct FTransformFragment { GENERATED_BODY() FVector Location; FQuat Rotation; };
-USTRUCT() struct FHealthFragment    { GENERATED_BODY() float Current = 0.f; float Max = 0.f; };
-USTRUCT() struct FTypeFragment      { GENERATED_BODY() int32 ConfigId = 0; };
-USTRUCT() struct FSupportFragment   { GENERATED_BODY() float SupportValue = 0.f; };
-
-// --- The replicated agent: ONLY what must go over the wire. Kept deliberately compact
-//     so the fast-array of these iterates fast and costs little bandwidth. ---
+// BuildingAgent.h — replicated agent holds ONLY what must cross the wire; cold state lives
+// behind a TSharedPtr, off the hot array, so copying agents never drags it along.
 USTRUCT()
-struct FBuildingAgent : public FReplicatedAgentBase
+struct FBuildingAgent
 {
     GENERATED_BODY()
 
-    UPROPERTY() FTransformFragment Transform;
-    UPROPERTY() FHealthFragment    Health;
-    UPROPERTY() FTypeFragment      Type;
-    UPROPERTY() FSupportFragment   Support;
+    UPROPERTY() FTransformFragment Transform;   //  \
+    UPROPERTY() FHealthFragment    Health;      //   } replicated fragments — compact & cache-friendly
+    UPROPERTY() FTypeFragment      Type;        //   /
+    UPROPERTY() FSupportFragment   Support;     //  /
 
-    // Non-replicated, per-instance runtime state lives OFF the hot array, behind a pointer,
-    // so copying agents around the fast-array never drags this along.
-    TSharedPtr<FBuildingTransient> Transient;
+    TSharedPtr<FBuildingTransient> Transient;   // NOT replicated: asset handle, bound proxy, selection...
 };
 ```
 
-**Why the split:** the replicated array is walked every frame for representation and
-replication. Keeping cold data (asset handles, bound proxy, editor/selection state) out of it
-made the hot path smaller and faster, and cut per-object memory.
+See [`src/BuildingAgent.h`](src/BuildingAgent.h).
 
 ---
 
-## 4. Delta replication with throttling + weak-net adaptation
+## 2. Delta replication with throttling + weak-net adaptation
 
-Even as data, thousands of pieces can't all sync at once. I replicate through a **fast-array
-delta channel** with a **per-frame change/delete budget** that *shrinks under packet loss* so
-the channel degrades gracefully.
+**Decision.** Replicate through a fast-array delta channel with a **per-frame change/delete
+budget** that *shrinks under packet loss*.
+
+**Why.** Even as data, thousands of pieces cannot all sync in one tick — and a naive burst makes
+congestion worse exactly when the network is already struggling. A per-frame budget spreads the
+cost; making that budget **network-adaptive** turns a hard failure (channel collapse under loss)
+into graceful degradation (slower, but stable).
 
 ```cpp
-int UBuildingClientBubble::GetChangesBudgetThisFrame() const
+// BuildingClientBubble.h — good network pushes a healthy batch; detected loss throttles hard.
+int32 UBuildingClientBubble::GetChangesBudgetThisFrame() const
 {
-    // Under good conditions push a healthy batch; under detected loss, throttle hard
-    // so we stop making congestion worse.
-    return bBadNetwork ? MaxChangesPerUpdate_BadNet   // e.g. 5
-                       : MaxChangesPerUpdate;         // e.g. 50
+    return bBadNetwork ? Val_MaxChangesPerUpdate_BadNet   // e.g. 5
+                       : Val_MaxChangesPerUpdate;         // e.g. 50
 }
 
 void UBuildingClientBubble::ServerTick()
 {
-    int Budget = GetChangesBudgetThisFrame();
-    for (FMassEntityHandle Entity : DirtyEntities)   // dirty set, priority-ordered
+    int32 Budget = GetChangesBudgetThisFrame();
+    for (uint32 Entity : DirtyEntities)          // dirty set, priority-ordered (distance/visibility)
     {
-        if (Budget-- <= 0) break;                    // rest waits for next tick
+        if (Budget-- <= 0) break;                // remainder waits for next tick
         MarkAgentDirtyForReplication(Entity);
     }
-    // Deletes have their own (larger) budget — cheap to send, important to apply promptly.
 }
 ```
 
+See [`src/BuildingClientBubble.h`](src/BuildingClientBubble.h).
+
 ---
 
-## 5. On-demand actors from a shared proxy pool
+## 3. On-demand actors from a shared proxy pool
 
-Interaction, collision, and UI still need a real `Actor` — but only for the handful of pieces
-the player is actually near. A subsystem lends **shared** proxy actors and reclaims them.
+**Decision.** Lend **shared** proxy actors from a capped pool, bound to an entity only while the
+player is near, and reclaimed on exit.
+
+**Why.** Interaction, collision, and UI genuinely need an `Actor` — but only for the pieces a
+player can actually touch, which is a tiny, bounded set at any moment. A pool with a hard
+`Val_MaxProxies` cap guarantees the live-actor count stays fixed *regardless* of how many thousands
+of buildings exist. That cap is the guarantee that makes the whole "entities, not actors" claim
+hold under adversarial player behaviour (e.g. someone building 10,000 walls).
 
 ```cpp
-// Bind an entity to a pooled Actor when it comes into interaction range; reclaim on exit.
-FProxyHandle UProxyPool::Acquire(FMassEntityHandle Entity, FName Reason)
-{
-    AProxyActor* Proxy = FreeList.Num() ? FreeList.Pop()
-                       : (LiveCount < MaxProxies ? SpawnNewProxy() : nullptr);
-    if (!Proxy) return {};                     // pool exhausted: stays pure data, no actor
-
-    Proxy->BindToEntity(Entity);               // pull transform/mesh/collision from fragments
-    Bindings.Add(Entity, { Proxy, /*lock*/1 });
-    return MakeHandle(Entity);
-}
-
-void UProxyPool::Release(FProxyHandle Handle, FName Reason)
-{
-    if (FBinding* B = Bindings.Find(Handle.Entity); B && --B->LockCount == 0)
-    {
-        B->Proxy->UnbindFromEntity();
-        FreeList.Push(B->Proxy);               // returned to the pool, not destroyed
-        Bindings.Remove(Handle.Entity);
-    }
-}
+// ProxyPool.h — a LockCount lets several systems (collision/interaction/UI) share one proxy;
+// the actor returns to the pool (not destroyed) when the last lock releases.
+FProxyHandle UProxyPool::Acquire(FEntityHandle Entity, FName Reason);   // near range -> bind
+void         UProxyPool::Release(FProxyHandle Handle, FName Reason);    // out of range -> reclaim
 ```
 
-`MaxProxies` caps the number of real actors regardless of how many thousands of buildings
-exist — the whole point.
+See [`src/ProxyPool.h`](src/ProxyPool.h).
 
 ---
 
-## 6. Modularity workflow (why the team could scale on it)
+## 4. Modularity as a workflow (why the team could scale on it)
 
-Building *behaviours* are small, composable pieces at three levels, so new objects are
-assembled, not coded from scratch:
+Building *behaviours* are composable at three levels, so a new object is **assembled, not coded**:
 
-1. **Fragments** — data a piece carries (support, coating, produce state…).
-2. **Components** — pluggable behaviours (snapping, interaction, level-up, production…).
-3. **Entity types** — a door, a furnace, an incubator = a specific combination of the above.
+| Level | Unit | Example |
+|---|---|---|
+| Data | **Fragment** | support value, coating, produce state |
+| Behaviour | **Component** | snapping, interaction, level-up, production |
+| Object | **Entity type** | a door / furnace / incubator = a specific combination |
 
-This is the open/closed principle as a *workflow*: adding a new building object touches no
-framework code, which is what let other engineers and designers add a large variety of
-objects efficiently.
+This is the open/closed principle expressed as a *pipeline*: adding a new building object touches
+no framework code. That is what let other engineers add features — and designers author a large
+variety of objects — efficiently and in parallel, throughout the project.
 
 ---
 
-## 7. Results
+## 🗂️ Repository layout
 
-- **Actor count decoupled from building count** — sync and rendering pressure dropped sharply
-  because most pieces are data + instanced meshes, not actors.
-- The system **survived multiple redesigns of the building rules** without foundational
-  rewrites, thanks to fragment/component composition.
-- The modular workflow let the team **keep shipping new building objects and features**
-  throughout the project.
+```
+data-oriented-building/
+├── README.md
+└── src/
+    ├── BuildingAgent.h          Fragment composition + replicated/transient split
+    ├── BuildingClientBubble.h   Delta replication: per-frame budget + weak-net throttle
+    └── ProxyPool.h              On-demand shared-Actor pool with a hard cap
+```
 
-## 8. What this demonstrates
+A **reduced reference**: the load-bearing data model, replication throttle, and pooling, with the
+engine's fast-array/ISM/subsystem plumbing abstracted so the design reads clearly.
 
-Data-oriented / ECS thinking applied to a real scaling problem; comfort across replication,
-rendering (instancing), memory layout, and pooling; and architecture designed for **constant
-change** and for **other people to extend**.
+---
+
+## 💡 What this demonstrates
+
+Data-oriented / ECS thinking applied to a concrete scaling problem; fluency across replication,
+instanced rendering, memory layout, and pooling; and — the part I care about most — an
+architecture designed for **constant change** and for **other people to extend**, not just to
+perform.
+
+## 📜 Notes
+
+Original reference code authored by me for portfolio purposes. No proprietary or third-party source
+is included; engine-facing types (fragments, client bubble, proxy actors) are illustrative
+stand-ins for the real integration points.
