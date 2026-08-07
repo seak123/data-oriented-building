@@ -44,15 +44,17 @@ building **rules were redesigned several times** during development, so the syst
 
 ## 🧭 Architecture — entities, not actors
 
-```
-   Persistence (DB)  <--dump/load-->   Entity Store (fragments)  <--delta-->  Clients
-        version #s                          |            |
-                            +---------------+            +---------------+
-                            |                                            |
-                   Representation                                   Proxy Pool
-                   (Instanced Static Mesh)                    (shared Actors, on demand)
-                   thousands -> a few batches                only near / interacted pieces
-                                                             are promoted to a real Actor
+```mermaid
+flowchart LR
+    DB[("Persistence (DB)<br/>version #s")] <-->|dump / load| Store["<b>Entity Store</b><br/>(fragments)"]
+    Store <-->|delta channel| Clients(["Clients"])
+    Store --> Rep["<b>Representation</b><br/>Instanced Static Mesh<br/>thousands → a few batches"]
+    Store --> Pool["<b>Proxy Pool</b><br/>shared Actors · on demand<br/>only near / interacted pieces<br/>promoted to a real Actor"]
+
+    classDef store fill:#1f6feb22,stroke:#1f6feb,stroke-width:1px;
+    classDef db fill:#6f42c122,stroke:#6f42c1,stroke-width:1px;
+    class Store store;
+    class DB db;
 ```
 
 **The central idea:** *the number of live Actors is decoupled from the number of buildings.*
