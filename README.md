@@ -70,6 +70,74 @@ actors. Everything else in the design follows from that decision.
 
 ---
 
+## 🎮 Gameplay: pieces, components, and the build flow
+
+The data-oriented core above is the *storage / performance* layer. The gameplay a player actually
+touches lives in the actor-side **build pieces** and the **build flow** that places them.
+
+### Build pieces = a base actor + pluggable components
+
+A building object isn't a monolithic class — it's an `ABuildPiece` composed of only the
+components it needs. A wall needs snapping + support; a door adds interaction; a furnace adds
+production. Concrete objects subclass the base and initialize their own distinctive data.
+
+| Component | Responsibility |
+|---|---|
+| `BuildSnapComponent` | Snap points — what this piece can snap *to*, and what can snap to *it* |
+| `CombinableSlotComponent` | Slots that accept / reject specific pieces (a wall slot only takes a door or window) |
+| `BuildInteractComponent` | Proximity region that surfaces context actions (open door, deposit, light furnace) |
+
+```cpp
+// A concrete object is a small subclass that just wires its own data + interaction.
+class ADoorPiece : public ABuildPiece
+{
+    virtual void InitDistinctiveData() override { /* door-specific state */ }
+    virtual void OnInteract(APlayerCharacter* Player, int32 InteractionId) override
+    {
+        ToggleOpen();   // open / close — the door's whole gameplay is one override
+    }
+};
+```
+
+See [`src/BuildPiece.h`](src/BuildPiece.h).
+
+### The build flow: hold → snap → validate → place
+
+While the player "holds" a piece in preview, each frame the flow raycasts from the camera,
+gathers **snap candidates** (an *active* snap point on the held piece meeting a *passive* snap
+point on a nearby piece), ranks them by priority, snaps to the best, and validates placement
+(overlap / support / build-count limit / area) before allowing a commit — the preview turns
+green or red on that result.
+
+```cpp
+// Rank snap candidates and take the best; lower Priority value wins.
+bool UBuildHoldFlow::ResolveBestSnap(const TArray<FSnapCandidate>& Candidates, FTransform& OutPose) const
+{
+    const FSnapCandidate* Best = nullptr;
+    for (const FSnapCandidate& C : Candidates)
+        if (!Best || C.Priority < Best->Priority) Best = &C;
+
+    if (!Best) return false;
+    OutPose = ComputeSnappedPose(*Best);   // align the active point onto the passive point
+    return true;
+}
+
+// Placement is only legal if it passes every rule.
+EPlaceRejectReason UBuildHoldFlow::ValidatePlacement(const FTransform& Pose) const
+{
+    if (IsOverlapping(Pose))     return EPlaceRejectReason::Overlapping;
+    if (!HasEnoughSupport(Pose)) return EPlaceRejectReason::NoSupport;     // no floating pieces
+    if (ReachedBuildLimit())     return EPlaceRejectReason::ReachBuildLimit;
+    if (!InBuildableArea(Pose))  return EPlaceRejectReason::OutOfArea;
+    return EPlaceRejectReason::None;
+}
+```
+
+See [`src/BuildHoldFlow.h`](src/BuildHoldFlow.h). The same flow also drives **selecting, moving,
+and demolishing** existing pieces.
+
+---
+
 ## 1. Fragment composition + replicated / transient split
 
 **Decision.** Keep the replicated agent as small as possible; push everything that doesn't need
@@ -178,9 +246,11 @@ variety of objects — efficiently and in parallel, throughout the project.
 data-oriented-building/
 ├── README.md
 └── src/
-    ├── BuildingAgent.h          Fragment composition + replicated/transient split
-    ├── BuildingClientBubble.h   Delta replication: per-frame budget + weak-net throttle
-    └── ProxyPool.h              On-demand shared-Actor pool with a hard cap
+    ├── BuildPiece.h             Gameplay: base piece + pluggable functional components
+    ├── BuildHoldFlow.h          Gameplay: hold → snap → validate → place build flow
+    ├── BuildingAgent.h          Core: fragment composition + replicated/transient split
+    ├── BuildingClientBubble.h   Core: delta replication — per-frame budget + weak-net throttle
+    └── ProxyPool.h              Core: on-demand shared-Actor pool with a hard cap
 ```
 
 A **reduced reference**: the load-bearing data model, replication throttle, and pooling, with the
