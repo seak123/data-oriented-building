@@ -133,8 +133,58 @@ EPlaceRejectReason UBuildHoldFlow::ValidatePlacement(const FTransform& Pose) con
 }
 ```
 
-See [`src/BuildHoldFlow.h`](src/BuildHoldFlow.h). The same flow also drives **selecting, moving,
-and demolishing** existing pieces.
+Validation order is deliberate: cheap rules first (build-count, area), expensive ones last
+(overlap sweep, trial support calculation) — because this runs *every frame while holding*. The
+same flow, switched by mode, also drives **select / move / demolish / repair / paint**. See
+[`src/BuildHoldFlow.h`](src/BuildHoldFlow.h).
+
+### Structural support: nothing floats
+
+Support isn't a per-piece flag — it's a **field that propagates**. Pieces touching terrain (or a
+support-supplying object like a totem) are *sources* and receive full support. Everyone else
+inherits from the neighbours they touch, decayed by distance and direction:
+
+```cpp
+// 传播损耗 / Propagation loss: lerp between horizontal and vertical loss by direction,
+// then scale by centre distance — the further from support, the less you inherit.
+float PropagateSupport(float NeighbourSupport, const FSupportParams& P,
+                       float DirectionT, float CentreDistance)
+{
+    const float Loss = FMath::Lerp(P.HorizontalLoss, P.VerticalLoss, DirectionT);
+    return NeighbourSupport - Loss * CentreDistance * NeighbourSupport;
+}
+```
+
+Gameplay consequences that fall out of this, with no special-case code:
+
+- **Cantilevers sag.** Horizontal loss is tuned higher, so building outward runs out of support
+  faster than building upward — you need pillars to reach far.
+- **Rubble can't prop up rubble.** A neighbour below *its own* minimum contributes nothing.
+- **Multi-point support is sturdier.** Two or more supports underneath grant a bonus.
+- **Below minimum → collapse**, which dirties the neighbours and can cascade.
+
+Two engineering constraints shaped the implementation: it's a **global convergence** problem (A
+supports B supports C, so one edit ripples), solved by **iterative relaxation** until the field is
+stable; and it must be **amortized across frames**, since recomputing thousands of pieces in one
+tick would stall the game thread. See [`src/BuildSupportSystem.h`](src/BuildSupportSystem.h).
+
+### Production entities: fuel, workload, products
+
+Furnaces, campfires, kilns and mills share one model — three queues (fuel / inputs / products).
+The notable decision: progress is tracked as **workload, not remaining seconds**.
+
+```cpp
+// 工作量而非剩余秒数 / Workload, not remaining time — because throughput is modified by
+// entity level, creature helpers, buffs and weather. Each tick simply subtracts at the
+// CURRENT rate, so mid-run speed changes and offline settlement need no retro-conversion.
+UPROPERTY(Replicated) TArray<int32>  InputWorkloads;   // remaining workload per input
+UPROPERTY(Replicated) double         FirstFuelTime;    // burn time left on the head fuel
+```
+
+A workbench is simply a queue-work entity with **capacity 1** — which is what let benches,
+cooking stations and furnaces share one UI and one code path. Some entities need no fuel at all
+(a windmill runs on wind, a mill on creature labour); that's config, not a new class. See
+[`src/ProductionEntity.h`](src/ProductionEntity.h).
 
 ---
 
@@ -248,6 +298,8 @@ data-oriented-building/
 └── src/
     ├── BuildPiece.h             Gameplay: base piece + pluggable functional components
     ├── BuildHoldFlow.h          Gameplay: hold → snap → validate → place build flow
+    ├── BuildSupportSystem.h     Gameplay: support propagation, collapse, iterative relaxation
+    ├── ProductionEntity.h       Gameplay: fuel / workload / product queues, queue-work benches
     ├── BuildingAgent.h          Core: fragment composition + replicated/transient split
     ├── BuildingClientBubble.h   Core: delta replication — per-frame budget + weak-net throttle
     └── ProxyPool.h              Core: on-demand shared-Actor pool with a hard cap
