@@ -15,10 +15,16 @@
 
 ## 📌 Context
 
-This distills a system I designed and owned in a shipped commercial title, where players build
-homes freely and buildings persist **permanently** — a single base can hold **thousands** of
-pieces. I was responsible for the whole framework: persistence, synchronization, entity/proxy
-management, and the modular workflow other engineers and designers extended.
+This distills a system I designed and owned on **_Light of Motiram_** (Tencent, Unreal Engine ·
+C++), where players build homes freely and buildings persist **permanently** — a single base can
+hold **thousands** of pieces. I was responsible for the whole framework: persistence,
+synchronization, entity/proxy management, and the modular workflow other engineers and designers
+extended.
+
+> **Related systems I owned on the same title:** players assemble watercraft out of these very
+> building pieces — see [watercraft-physics](https://github.com/seak123/watercraft-physics) — and
+> production buildings are worked by creatures via
+> [automation-ai-productionline](https://github.com/seak123/automation-ai-productionline).
 
 > **This repository is a clean-room reference.** Original code written for portfolio purposes,
 > reduced to the load-bearing architecture. It contains **no proprietary or third-party source**;
